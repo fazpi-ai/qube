@@ -1,1 +1,1 @@
-export default './Queue.js'
+export { default } from './Queue.js';
