@@ -1,13 +1,21 @@
+import { fileURLToPath } from 'url';
+import { dirname, resolve, join } from 'path';
+import fs from 'fs';
 import Redis from 'ioredis';
 import { createPool } from 'generic-pool';
 import pino from 'pino';
 
 const logger = pino({ level: 'debug' });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 export default class Queue {
-
+    pendingGroupConsumers = [];
     processMap = new Map();
-    isReady = false; // 🔥 Nueva bandera para asegurarse de que subscribe() esté listo antes de publicar.
+    isReady = false;
+    scripts = {};
+
+    inactivityTimeout = 2000;
 
     constructor(credentials) {
         this.credentials = credentials;
@@ -33,75 +41,306 @@ export default class Queue {
                     return false;
                 }
             }
-        }, { max: 10, min: 2 });
+        }, { max: 100, min: 2 });
 
         logger.debug('Pool de conexiones creado');
-
         this.subscriber = new Redis(this.credentials);
+        this.publisher = new Redis(this.credentials);
+
+        this.instanceId = Math.random().toString(36).substr(2, 9);
+        this.localTimers = new Map();
+    }
+
+    async init() {
+        this.enqueueScript = fs.readFileSync(join(__dirname, './lua-scripts/enqueue.lua'), 'utf8');
+        this.dequeueScript = fs.readFileSync(join(__dirname, './lua-scripts/dequeue.lua'), 'utf8');
+        this.updateStatusScript = fs.readFileSync(join(__dirname, './lua-scripts/update_status.lua'), 'utf8');
+        this.getStatusScript = fs.readFileSync(join(__dirname, './lua-scripts/get_status.lua'), 'utf8');
+
+        this.scriptsLoaded = (async () => {
+            const client = await this.pool.acquire();
+            try {
+                this.enqueueSha = await client.script('LOAD', this.enqueueScript);
+                this.dequeueSha = await client.script('LOAD', this.dequeueScript);
+                this.updateStatusSha = await client.script('LOAD', this.updateStatusScript);
+                this.getStatusSha = await client.script('LOAD', this.getStatusScript);
+            } finally {
+                await this.pool.release(client);
+            }
+        })();
+        await this.scriptsLoaded;
+        logger.info("✅ Scripts Lua cargados correctamente.");
         this.listenToPubSub();
     }
 
     async getClient() {
         logger.debug('Adquiriendo cliente de Redis');
+        this.getPoolStats()
         return this.pool.acquire();
     }
 
     async releaseClient(client) {
         logger.debug('Liberando cliente de Redis');
+        this.getPoolStats()
         await this.pool.release(client);
     }
 
-    async listenToPubSub() {
-        logger.info("📡 Suscribiéndose al canal 'QUEUE-NOTIFY' en Redis Pub/Sub...");
+    async runLuaScript(scriptName, keys = [], args = []) {
+        if (!this.scripts[scriptName]) {
+            throw new Error(`Script Lua no encontrado: ${scriptName}`);
+        }
+        const client = await this.getClient();
+        try {
+            return await client.eval(this.scripts[scriptName], keys.length, ...keys, ...args);
+        } catch (err) {
+            logger.error(`❌ Error ejecutando script Lua '${scriptName}': ${err.message}`);
+            throw err;
+        } finally {
+            await this.releaseClient(client);
+        }
+    }
 
+    // Agrega este método a la clase Queue:
+    getPoolStats() {
+        logger.info(`👾 Pool Stats - Size: ${this.pool.size}, Available: ${this.pool.available}, Borrowed: ${this.pool.borrowed}, Pending: ${this.pool.pending}`);
+    }
+
+    async updateJobStatus(jobId, newStatus) {
+        await this.scriptsLoaded;
+        const client = await this.getClient();
+        try {
+            await client.evalsha(this.updateStatusSha, 0, jobId, newStatus);
+        } finally {
+            await this.releaseClient(client);
+        }
+    }
+
+    async listenToPubSub() {
+        logger.info("📡 Suscribiéndose al canal 'QUEUE:NEWJOB' en Redis Pub/Sub...");
         await new Promise((resolve, reject) => {
-            this.subscriber.subscribe('QUEUE-NOTIFY', (err, count) => {
+            this.subscriber.subscribe('QUEUE:NEWJOB', (err, count) => {
                 if (err) {
-                    logger.error(`❌ Error suscribiéndose a 'QUEUE-NOTIFY': ${err.message}`);
+                    logger.error(`❌ Error suscribiéndose a 'QUEUE:NEWJOB': ${err.message}`);
                     reject(err);
                 } else {
                     logger.info(`✅ Suscrito a ${count} canal(es), esperando mensajes...`);
-                    this.isReady = true; // 🔥 Marcamos que el suscriptor ya está listo
+                    this.isReady = true;
                     resolve();
                 }
             });
         });
-
-        this.subscriber.on('message', (channel, message) => {
-            if (channel === 'QUEUE-NOTIFY') {
-                try {
-                    const { task, group } = JSON.parse(message);
-                    logger.info(`🔔 Notificación recibida: Nuevo mensaje en task '${task}', grupo '${group}'`);
-
-                    if (this.processMap.has(task)) {
-                        logger.info(`✅ Se encontró callback para el task '${task}', ejecutando...`);
-                        this.processMap.get(task)({ task, group });
-                    } else {
-                        logger.warn(`⚠️ No hay callback asociado al task '${task}', ignorando notificación.`);
-                    }
-                } catch (error) {
-                    logger.error("❌ Error procesando mensaje de Pub/Sub:", error);
+        this.subscriber.on('message', async (channel, message) => {
+            if (channel === 'QUEUE:NEWJOB') {
+                const { queueName, groupName } = JSON.parse(message);
+                logger.info(`🔔 Notificación recibida: Nuevo mensaje en queueName '${queueName}', grupo '${groupName}'`);
+                if (this.processMap.has(queueName)) {
+                    logger.info(`✅ Se encontró callback para el queueName '${queueName}', ejecutando...`);
+                    await this.startGroupConsumer(queueName, groupName, null, false, this.processMap.get(queueName).nConsumers);
+                } else {
+                    logger.warn(`⚠️ No hay callback asociado al queueName '${queueName}', ignorando notificación.`);
                 }
             }
         });
     }
 
-    async add(task, group, data) {
-        // 🔥 Esperar a que `subscribe()` esté listo antes de publicar
-        while (!this.isReady) {
-            logger.warn("⏳ Esperando a que el suscriptor de Redis esté listo...");
-            await new Promise(resolve => setTimeout(resolve, 100)); // Espera 100ms y vuelve a intentar
-        }
-
+    async addActiveConsumer(queueName, groupName, workerId, info) {
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
         const client = await this.getClient();
-        await client.publish('QUEUE-NOTIFY', JSON.stringify({ task, group }));
-        logger.info(`📢 Notificación enviada: Nuevo mensaje en task '${task}', grupo '${group}'`);
-
-        return "xxxx";
+        await client.hset('activeGroupConsumers', consumerKey, JSON.stringify(info));
+        await this.releaseClient(client);
     }
 
-    async process(task, nConsumers = 1, callback) {
-        this.processMap.set(task, callback);
+    async getActiveConsumer(queueName, groupName, workerId) {
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
+        const client = await this.getClient();
+        const data = await client.hget('activeGroupConsumers', consumerKey);
+        await this.releaseClient(client);
+        return data ? JSON.parse(data) : null;
+    }
+
+    async deleteActiveConsumer(queueName, groupName, workerId) {
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
+        const client = await this.getClient();
+        await client.hdel('activeGroupConsumers', consumerKey);
+        await this.releaseClient(client);
+    }
+
+    async countActiveConsumersForGroup(queueName, groupName) {
+        const client = await this.getClient();
+        const keys = await client.hkeys('activeGroupConsumers');
+        const prefix = `qube:${queueName}:${groupName}:`;
+        const count = keys.filter(key => key.startsWith(prefix)).length;
+        await this.releaseClient(client);
+        return count;
+    }
+
+    async checkGroupConsumerInactivity(queueName, groupName, workerId) {
+        const consumerInfo = await this.getActiveConsumer(queueName, groupName, workerId);
+        return consumerInfo && consumerInfo.shouldStop;
+    }
+
+    async stopGroupConsumer(queueName, groupName, workerId) {
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
+        const consumerInfo = await this.getActiveConsumer(queueName, groupName, workerId);
+        if (consumerInfo) {
+            if (consumerInfo.owner === this.instanceId && this.localTimers.has(consumerKey)) {
+                clearTimeout(this.localTimers.get(consumerKey));
+                this.localTimers.delete(consumerKey);
+            }
+            await this.deleteActiveConsumer(queueName, groupName, workerId);
+            await this.processPendingConsumers(this.processMap.get(queueName).nConsumers);
+        }
+    }
+
+    async processPendingConsumers(nConsumers) {
+        while (this.pendingGroupConsumers.length > 0) {
+            const { queueName, groupName, groupKey } = this.pendingGroupConsumers.shift();
+            const count = await this.countActiveConsumersForGroup(queueName, groupName);
+            if (count < nConsumers) {
+                await this.startGroupConsumer(queueName, groupName, groupKey, true, nConsumers);
+            }
+        }
+    }
+
+    async updateProgress(jobId, value) {
+        const client = await this.getClient();
+        try {
+            await client.hset(`qube:job:${jobId}`, 'progress', value);
+        } finally {
+            await this.releaseClient(client);
+        }
+    }
+
+    async resetGroupConsumerTimer(queueName, groupName, workerId) {
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
+        const consumerInfo = await this.getActiveConsumer(queueName, groupName, workerId);
+        if (consumerInfo && consumerInfo.owner === this.instanceId) {
+            if (this.localTimers.has(consumerKey)) {
+                clearTimeout(this.localTimers.get(consumerKey));
+            }
+            const timer = setTimeout(async () => {
+                const current = await this.getActiveConsumer(queueName, groupName, workerId);
+                if (current && !current.shouldStop) {
+                    current.shouldStop = true;
+                    await this.addActiveConsumer(queueName, groupName, workerId, current);
+                }
+            }, this.inactivityTimeout);
+            this.localTimers.set(consumerKey, timer);
+        }
+    }
+
+    async groupWorker(queueName, groupName, groupKey, workerId) {
+        await this.scriptsLoaded;
+        const client = await this.getClient();
+        try {
+            logger.info("GROUP WORKER:", { queueName, groupName, groupKey, workerId });
+            while (true) {
+                const result = await client.evalsha(this.dequeueSha, 1, groupKey);
+                logger.debug("result:", result);
+                if (result) {
+                    await this.resetGroupConsumerTimer(queueName, groupName, workerId);
+                    const [jobId, jobDataRaw, groupNameFromJob] = result;
+                    const jobDataParsed = jobDataRaw ? JSON.parse(jobDataRaw) : null;
+                    const job = {
+                        id: jobId,
+                        data: jobDataParsed,
+                        groupName: groupNameFromJob ? groupNameFromJob.toString() : undefined,
+                        progress: (value) => this.updateProgress(jobId, value)
+                    };
+                    await this.processJob(queueName, job, this.processMap.get(queueName).callback);
+                } else {
+                    const shouldStop = await this.checkGroupConsumerInactivity(queueName, groupName, workerId);
+                    if (shouldStop) {
+                        await this.stopGroupConsumer(queueName, groupName, workerId);
+                        break;
+                    } else {
+                        await new Promise((r) => setTimeout(r, 1000));
+                    }
+                }
+            }
+        } finally {
+            await this.releaseClient(client);
+        }
+    }
+
+    async processJob(queueName, job, fn) {
+        const done = async (err) => {
+            if (err) {
+                await this.updateJobStatus(job.id, 'failed');
+            } else {
+                await this.updateJobStatus(job.id, 'completed');
+            }
+        };
+        try {
+            await fn(job, done);
+        } catch (error) {
+            await this.updateJobStatus(job.id, 'failed');
+        }
+    }
+
+    async startGroupConsumer(queueName, groupName, groupKey = null, fromPending = false, nConsumers = 1) {
+        if (!groupKey) {
+            groupKey = `qube:${queueName}:group:${groupName}`;
+        }
+        const count = await this.countActiveConsumersForGroup(queueName, groupName);
+        if (count >= nConsumers) {
+            if (!fromPending) {
+                this.pendingGroupConsumers.push({ queueName, groupName, groupKey });
+            }
+            return;
+        }
+        const workerId = Math.random().toString(36).substr(2, 9);
+        await this.addActiveConsumer(queueName, groupName, workerId, { owner: this.instanceId, shouldStop: false, workerId });
+        const timer = setTimeout(async () => {
+            const current = await this.getActiveConsumer(queueName, groupName, workerId);
+            if (current && !current.shouldStop) {
+                current.shouldStop = true;
+                await this.addActiveConsumer(queueName, groupName, workerId, current);
+            }
+        }, this.inactivityTimeout);
+        const consumerKey = `qube:${queueName}:${groupName}:${workerId}`;
+        this.localTimers.set(consumerKey, timer);
+        this.groupWorker(queueName, groupName, groupKey, workerId);
+    }
+
+    async add(queueName, groupName, data) {
+        await this.scriptsLoaded;
+        const client = await this.getClient();
+        try {
+            const queueKey = `qube:${queueName}:groups`;
+            const groupKey = `qube:${queueName}:group:${groupName}`;
+            const jobId = await client.evalsha(
+                this.enqueueSha,
+                2,
+                queueKey,
+                groupKey,
+                JSON.stringify(data),
+                groupName
+            );
+            await this.publisher.publish('QUEUE:NEWJOB', JSON.stringify({ queueName, groupName }));
+            return jobId;
+        } finally {
+            await this.releaseClient(client);
+        }
+    }
+
+    async process(queueName, nConsumers = 1, callback) {
+        await this.scriptsLoaded;
+        const client = await this.getClient();
+        try {
+            this.processMap.set(queueName, { callback, nConsumers });
+            const groups = await client.smembers(`qube:${queueName}:groups`);
+            for (let groupName of groups) {
+                if (groupName.startsWith(`qube:${queueName}:group:`)) {
+                    groupName = groupName.split(`qube:${queueName}:group:`)[1];
+                }
+                for (let i = 0; i < nConsumers; i++) {
+                    await this.startGroupConsumer(queueName, groupName, null, false, nConsumers);
+                }
+            }
+        } finally {
+            await this.releaseClient(client);
+        }
     }
 
     async close() {

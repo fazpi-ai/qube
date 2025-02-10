@@ -8,10 +8,17 @@ import Queue from "../src/Queue.js";
         db: 0               // Base de datos por defecto
     });
 
+    await QUEUE.init()
+
     console.log("✅ Conexión a Redis en Docker establecida.");
 
     QUEUE.process('CHANNEL', 1, (job, done) => {
+        console.log("job:")
+        console.log(job)
 
+        done(null, {
+            message: 'ok'
+        })
     })
 
 })();
