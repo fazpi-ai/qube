@@ -41,7 +41,7 @@ export default class Queue {
                     return false;
                 }
             }
-        }, { max: 100, min: 2 });
+        }, { max: 1000, min: 2 });
 
         logger.debug('Pool de conexiones creado');
         this.subscriber = new Redis(this.credentials);
