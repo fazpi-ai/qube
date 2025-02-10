@@ -9,4 +9,9 @@ import Queue from "../src/Queue.js";
     });
 
     console.log("✅ Conexión a Redis en Docker establecida.");
+
+    QUEUE.process('CHANNEL', 1, (job, done) => {
+
+    })
+
 })();
