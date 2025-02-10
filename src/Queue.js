@@ -105,14 +105,25 @@ export default class Queue {
         logger.info(`👾 Pool Stats - Size: ${this.pool.size}, Available: ${this.pool.available}, Borrowed: ${this.pool.borrowed}, Pending: ${this.pool.pending}`);
     }
 
-    async updateJobStatus(jobId, newStatus) {
-        await this.scriptsLoaded;
+    async safeEvalsha(scriptKey, keysCount, ...args) {
         const client = await this.getClient();
         try {
-            await client.evalsha(this.updateStatusSha, 0, jobId, newStatus);
+            return await client.evalsha(this[`${scriptKey}Sha`], keysCount, ...args);
+        } catch (err) {
+            if (err.message.includes('NOSCRIPT')) {
+                // Reload the script if it was not found
+                this[`${scriptKey}Sha`] = await client.script('LOAD', this[`${scriptKey}Script`]);
+                return await client.evalsha(this[`${scriptKey}Sha`], keysCount, ...args);
+            }
+            throw err;
         } finally {
             await this.releaseClient(client);
         }
+    }
+
+    async updateJobStatus(jobId, newStatus) {
+        await this.scriptsLoaded;
+        await this.safeEvalsha('updateStatus', 0, jobId, newStatus);
     }
 
     async listenToPubSub() {
@@ -235,7 +246,8 @@ export default class Queue {
         try {
             logger.info("GROUP WORKER:", { queueName, groupName, groupKey, workerId });
             while (true) {
-                const result = await client.evalsha(this.dequeueSha, 1, groupKey);
+                // const result = await client.evalsha(this.dequeueSha, 1, groupKey);
+                const result = await this.safeEvalsha('dequeue', 1, groupKey);
                 logger.debug("result:", result);
                 if (result) {
                     await this.resetGroupConsumerTimer(queueName, groupName, workerId);
@@ -309,6 +321,8 @@ export default class Queue {
         try {
             const queueKey = `qube:${queueName}:groups`;
             const groupKey = `qube:${queueName}:group:${groupName}`;
+            const jobId = await this.safeEvalsha('enqueue', 2, queueKey, groupKey, JSON.stringify(data), groupName);
+            /*
             const jobId = await client.evalsha(
                 this.enqueueSha,
                 2,
@@ -317,6 +331,7 @@ export default class Queue {
                 JSON.stringify(data),
                 groupName
             );
+            */
             await this.publisher.publish('QUEUE:NEWJOB', JSON.stringify({ queueName, groupName }));
             return jobId;
         } finally {
