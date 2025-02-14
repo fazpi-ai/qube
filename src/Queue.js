@@ -5,7 +5,6 @@ import Redis from 'ioredis';
 import { createPool } from 'generic-pool';
 import pino from 'pino';
 
-const logger = pino({ level: 'debug' });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -21,17 +20,17 @@ export default class Queue {
         this.credentials = credentials;
         this.logger = pino({ level: logLevel });
         this.client = new Redis(credentials);
-        this.client.on('connect', () => logger.debug('Conexión a Redis establecida'));
-        this.client.on('error', (err) => logger.error(`Error en Redis: ${err.message}`));
+        this.client.on('connect', () => this.logger.debug('Conexión a Redis establecida'));
+        this.client.on('error', (err) => this.logger.error(`Error en Redis: ${err.message}`));
 
         this.pool = createPool({
             create: async () => {
                 const client = new Redis(credentials);
-                client.on('error', (err) => logger.error(`Error en conexión del pool: ${err.message}`));
+                client.on('error', (err) => this.logger.error(`Error en conexión del pool: ${err.message}`));
                 return client;
             },
             destroy: async (client) => {
-                logger.debug('Cerrando cliente de Redis del pool');
+                this.logger.debug('Cerrando cliente de Redis del pool');
                 await client.quit();
             },
             validate: async (client) => {
@@ -44,7 +43,7 @@ export default class Queue {
             }
         }, { max: 1000, min: 2 });
 
-        logger.debug('Pool de conexiones creado');
+        this.logger.debug('Pool de conexiones creado');
         this.subscriber = new Redis(this.credentials);
         this.publisher = new Redis(this.credentials);
 
@@ -70,18 +69,18 @@ export default class Queue {
             }
         })();
         await this.scriptsLoaded;
-        logger.info("✅ Scripts Lua cargados correctamente.");
+        this.logger.info("✅ Scripts Lua cargados correctamente.");
         this.listenToPubSub();
     }
 
     async getClient() {
-        logger.debug('Adquiriendo cliente de Redis');
+        this.logger.debug('Adquiriendo cliente de Redis');
         this.getPoolStats()
         return this.pool.acquire();
     }
 
     async releaseClient(client) {
-        logger.debug('Liberando cliente de Redis');
+        this.logger.debug('Liberando cliente de Redis');
         this.getPoolStats()
         await this.pool.release(client);
     }
@@ -94,7 +93,7 @@ export default class Queue {
         try {
             return await client.eval(this.scripts[scriptName], keys.length, ...keys, ...args);
         } catch (err) {
-            logger.error(`❌ Error ejecutando script Lua '${scriptName}': ${err.message}`);
+            this.logger.error(`❌ Error ejecutando script Lua '${scriptName}': ${err.message}`);
             throw err;
         } finally {
             await this.releaseClient(client);
@@ -103,7 +102,7 @@ export default class Queue {
 
     // Agrega este método a la clase Queue:
     getPoolStats() {
-        logger.info(`👾 Pool Stats - Size: ${this.pool.size}, Available: ${this.pool.available}, Borrowed: ${this.pool.borrowed}, Pending: ${this.pool.pending}`);
+        this.logger.info(`👾 Pool Stats - Size: ${this.pool.size}, Available: ${this.pool.available}, Borrowed: ${this.pool.borrowed}, Pending: ${this.pool.pending}`);
     }
 
     async safeEvalsha(scriptKey, keysCount, ...args) {
@@ -128,14 +127,14 @@ export default class Queue {
     }
 
     async listenToPubSub() {
-        logger.info("📡 Suscribiéndose al canal 'QUEUE:NEWJOB' en Redis Pub/Sub...");
+        this.logger.info("📡 Suscribiéndose al canal 'QUEUE:NEWJOB' en Redis Pub/Sub...");
         await new Promise((resolve, reject) => {
             this.subscriber.subscribe('QUEUE:NEWJOB', (err, count) => {
                 if (err) {
-                    logger.error(`❌ Error suscribiéndose a 'QUEUE:NEWJOB': ${err.message}`);
+                    this.logger.error(`❌ Error suscribiéndose a 'QUEUE:NEWJOB': ${err.message}`);
                     reject(err);
                 } else {
-                    logger.info(`✅ Suscrito a ${count} canal(es), esperando mensajes...`);
+                    this.logger.info(`✅ Suscrito a ${count} canal(es), esperando mensajes...`);
                     this.isReady = true;
                     resolve();
                 }
@@ -144,12 +143,12 @@ export default class Queue {
         this.subscriber.on('message', async (channel, message) => {
             if (channel === 'QUEUE:NEWJOB') {
                 const { queueName, groupName } = JSON.parse(message);
-                logger.info(`🔔 Notificación recibida: Nuevo mensaje en queueName '${queueName}', grupo '${groupName}'`);
+                this.logger.info(`🔔 Notificación recibida: Nuevo mensaje en queueName '${queueName}', grupo '${groupName}'`);
                 if (this.processMap.has(queueName)) {
-                    logger.info(`✅ Se encontró callback para el queueName '${queueName}', ejecutando...`);
+                    this.logger.info(`✅ Se encontró callback para el queueName '${queueName}', ejecutando...`);
                     await this.startGroupConsumer(queueName, groupName, null, false, this.processMap.get(queueName).nConsumers);
                 } else {
-                    logger.warn(`⚠️ No hay callback asociado al queueName '${queueName}', ignorando notificación.`);
+                    this.logger.warn(`⚠️ No hay callback asociado al queueName '${queueName}', ignorando notificación.`);
                 }
             }
         });
@@ -245,11 +244,11 @@ export default class Queue {
         await this.scriptsLoaded;
         const client = await this.getClient();
         try {
-            logger.info("GROUP WORKER:", { queueName, groupName, groupKey, workerId });
+            this.logger.info("GROUP WORKER:", { queueName, groupName, groupKey, workerId });
             while (true) {
                 // const result = await client.evalsha(this.dequeueSha, 1, groupKey);
                 const result = await this.safeEvalsha('dequeue', 1, groupKey);
-                logger.debug("result:", result);
+                this.logger.debug("result:", result);
                 if (result) {
                     await this.resetGroupConsumerTimer(queueName, groupName, workerId);
                     const [jobId, jobDataRaw, groupNameFromJob] = result;
@@ -360,7 +359,7 @@ export default class Queue {
     }
 
     async close() {
-        logger.debug('Cerrando conexiones de Redis y pool');
+        this.logger.debug('Cerrando conexiones de Redis y pool');
         await this.pool.drain();
         await this.pool.clear();
         await this.client.quit();
