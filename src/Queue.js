@@ -17,8 +17,9 @@ export default class Queue {
 
     inactivityTimeout = 2000;
 
-    constructor(credentials) {
+    constructor(credentials, logLevel = 'debug') {
         this.credentials = credentials;
+        this.logger = pino({ level: logLevel });
         this.client = new Redis(credentials);
         this.client.on('connect', () => logger.debug('Conexión a Redis establecida'));
         this.client.on('error', (err) => logger.error(`Error en Redis: ${err.message}`));
